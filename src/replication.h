@@ -12,6 +12,7 @@
 #include "status.h"
 #include "storage.h"
 #include "redis_connection.h"
+#include "redis_db.h"
 
 class Server;
 
@@ -176,6 +177,7 @@ class ReplicationThread {
  */
 class WriteBatchHandler : public rocksdb::WriteBatch::Handler {
  public:
+  void LogData(const rocksdb::Slice &blob) override;
   rocksdb::Status PutCF(uint32_t column_family_id, const rocksdb::Slice &key,
                         const rocksdb::Slice &value) override;
 
@@ -185,4 +187,8 @@ class WriteBatchHandler : public rocksdb::WriteBatch::Handler {
  private:
   std::pair<std::string, std::string> publish_message_;
   bool is_publish_ = false;
+  std::map<std::string, std::vector<std::string>> aof_strings_;
+  Redis::WriteBatchLogData log_data_;
+  bool firstSeen_ = true;
+  std::string Command2RESP(const std::vector<std::string> &cmd_args);
 };

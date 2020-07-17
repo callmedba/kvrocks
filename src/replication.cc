@@ -787,13 +787,104 @@ bool ReplicationThread::isRestoringError(const char *err) {
   return std::string(err) == "-ERR restoring the db from backup";
 }
 
+void WriteBatchHandler::LogData(const rocksdb::Slice &blob) {
+  log_data_.Decode(blob);
+}
+
 rocksdb::Status WriteBatchHandler::PutCF(uint32_t column_family_id, const rocksdb::Slice &key,
                                          const rocksdb::Slice &value) {
-  if (column_family_id != kColumnFamilyIDPubSub) {
+  if (column_family_id == kColumnFamilyIDZSetScore) {
     return rocksdb::Status::OK();
   }
 
-  publish_message_ = std::make_pair(key.ToString(), value.ToString());
-  is_publish_ = true;
+  std::string ns, user_key, sub_key;
+  std::vector<std::string> command_args;
+  if (column_family_id == kColumnFamilyIDMetadata) {
+    ExtractNamespaceKey(key, &ns, &user_key);
+    Metadata metadata(kRedisNone);
+    metadata.Decode(value.ToString());
+    if (metadata.Type() == kRedisString) {
+      command_args = {"SET", user_key, value.ToString().substr(5, value.size() - 5)};
+      aof_strings_[ns].emplace_back(Command2RESP(command_args));
+      if (metadata.expire > 0) {
+        command_args = {"EXPIREAT", user_key, std::to_string(metadata.expire)};
+        aof_strings_[ns].emplace_back(Command2RESP(command_args));
+      }
+    } else if (metadata.expire > 0) {
+      auto args = log_data_.GetArguments();
+      if (args->size() > 0) {
+        RedisCommand cmd = static_cast<RedisCommand >(std::stoi((*args)[0]));
+        if (cmd == kRedisCmdExpire) {
+          command_args = {"EXPIREAT", user_key, std::to_string(metadata.expire)};
+          aof_strings_[ns].emplace_back(Command2RESP(command_args));
+        }
+      }
+    }
+
+    return rocksdb::Status::OK();
+  }
+
+  if (column_family_id == kColumnFamilyIDDefault) {
+    InternalKey ikey(key);
+    user_key = ikey.GetKey().ToString();
+    sub_key = ikey.GetSubKey().ToString();
+    ns = ikey.GetNamespace().ToString();
+    switch (log_data_.GetRedisType()) {
+      case kRedisHash:command_args = {"HSET", user_key, sub_key, value.ToString()};
+        break;
+      case kRedisList: {
+        auto args = log_data_.GetArguments();
+        if (args->size() < 1) {
+          LOG(ERROR) << "Fail to parse write_batch in putcf type list : args error ,should at least contain cmd";
+          return rocksdb::Status::OK();
+        }
+        RedisCommand cmd = static_cast<RedisCommand >(std::stoi((*args)[0]));
+        switch (cmd) {
+          case kRedisCmdLSet:
+            if (args->size() < 2) {
+              LOG(ERROR) << "Fail to parse write_batch in putcf cmd lset : args error ,should contain lset index";
+              return rocksdb::Status::OK();
+            }
+            command_args = {"LSET", user_key, (*args)[1], value.ToString()};
+            break;
+          case kRedisCmdLInsert:
+            if (firstSeen_) {
+              if (args->size() < 4) {
+                LOG(ERROR)
+                    << "Fail to parse write_batch in putcf cmd linsert : args error ,should contain before pivot value ";
+                return rocksdb::Status::OK();
+              }
+              command_args = {"LINSERT", user_key, (*args)[1] == "1" ? "before" : "after", (*args)[2], (*args)[3]};
+              firstSeen_ = false;
+            }
+            break;
+          default:command_args = {cmd == kRedisCmdLPush ? "LPUSH" : "RPUSH", user_key, value.ToString()};
+        }
+        break;
+      }
+      case kRedisSet:command_args = {"SADD", user_key, sub_key};
+        break;
+      case kRedisZSet: {
+        double score = DecodeDouble(value.data());
+        command_args = {"ZADD", user_key, std::to_string(score), sub_key};
+        break;
+      }
+      default: break;
+    }
+  }
+
+  if (!command_args.empty()) {
+    aof_strings_[ns].emplace_back(Command2RESP(command_args));
+  }
   return rocksdb::Status::OK();
+}
+
+std::string WriteBatchHandler::Command2RESP(const std::vector<std::string> &cmd_args) {
+  std::string output;
+  output.append("*" + std::to_string(cmd_args.size()) + CRLF);
+  for (const auto &arg : cmd_args) {
+    output.append("$" + std::to_string(arg.size()) + CRLF);
+    output.append(arg + CRLF);
+  }
+  return output;
 }

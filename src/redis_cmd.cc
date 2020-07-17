@@ -3355,9 +3355,20 @@ class CommandPSync : public Commander {
     auto s = storage->GetWALIter(seq, &iter);
     if (s.IsOK() && iter->Valid()) {
       auto batch = iter->GetBatch();
+      LOG(ERROR) << batch.writeBatchPtr->Count() << std::endl;
+      auto data = batch.writeBatchPtr->Data();
+      rocksdb::WriteBatch write_batch(data);
+      WriteBatchHandler write_batch_handler;
+      rocksdb::Status status;
+
+      status = write_batch.Iterate(&write_batch_handler);
       if (seq != batch.sequence) {
         LOG(ERROR) << "checkWALBoundary with sequence: " << seq
                    << ", but GetWALIter return older sequence: " << batch.sequence;
+        if (seq > batch.sequence) {
+          LOG(ERROR) << "checkWALBoundary with sequence: " << seq
+                     << ", but GetWALIter return older sequence: " << batch.sequence;
+        }
         return Status(Status::NotOK);
       }
       return Status::OK();
